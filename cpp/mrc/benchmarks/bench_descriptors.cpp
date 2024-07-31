@@ -212,18 +212,7 @@ class DescriptorFixture : public benchmark::Fixture
     template <typename T>
     void TransferFullDescriptors(benchmark::State& state)
     {
-        std::atomic<bool> is_running(true);
-        std::mutex progress_mutex;
-        std::condition_variable progress_cv;
-
-        auto progress_thread = std::thread([&]() {
-            std::unique_lock<std::mutex> lock(progress_mutex);
-            while (is_running)
-            {
-                m_resources->progress();
-                progress_cv.wait_for(lock, std::chrono::milliseconds(1)); // Sleep to reduce busy-waiting
-            }
-        });
+        m_resources->worker().startProgressThread();
 
         size_t messages_to_send = state.range(1);
         auto receive_thread = std::thread([&]() {
@@ -231,10 +220,7 @@ class DescriptorFixture : public benchmark::Fixture
             {
                 auto receive_request = m_resources->am_recv_async(m_loopback_endpoint);
 
-                while (!receive_request->isCompleted())
-                {
-                    std::this_thread::yield(); // Yield to avoid busy-waiting
-                }
+                while (!receive_request->isCompleted()) {}
 
                 auto buffer_view = memory::buffer_view(receive_request->getRecvBuffer()->data(),
                                                        receive_request->getRecvBuffer()->getSize(),
@@ -249,13 +235,13 @@ class DescriptorFixture : public benchmark::Fixture
             }
         });
 
-        std::vector<std::future<void>> send_futures;
+        std::vector<std::shared_ptr<ucxx::Request>> send_requests;
+        std::vector<memory::buffer> serialized_buffers;
+
         std::vector<std::weak_ptr<runtime::Descriptor2>> registered_send_descriptors;
 
-
-        auto send_function = [&](size_t i) {
-            cudaSetDevice(0); // Ensure the CUDA context is initialized
-
+        for (size_t i = 0; i < messages_to_send; ++i)
+        {
             auto send_data = std::any_cast<std::reference_wrapper<T>>(m_obj[i]->get_object()).get();
             std::shared_ptr<runtime::Descriptor2> send_descriptor = runtime::Descriptor2::create(std::move(send_data),
                                                                                                  *m_resources);
@@ -266,43 +252,28 @@ class DescriptorFixture : public benchmark::Fixture
 
             send_descriptor = nullptr;
 
-            auto send_request = m_resources->am_send_async(m_loopback_endpoint, serialized_data);
+            send_requests.push_back(m_resources->am_send_async(m_loopback_endpoint, serialized_data));
+            serialized_buffers.push_back(std::move(serialized_data));
 
             // Acquire the registered descriptor as a `weak_ptr` which we can use to immediately verify to be valid, but
             // invalid once `DataPlaneResources2` releases it.
             registered_send_descriptors.push_back(m_resources->get_descriptor(send_descriptor_object_id));
-
-            while (!send_request->isCompleted())
-            {
-                std::this_thread::yield(); // Yield to avoid busy-waiting
-            }
-        };
-
-        for (size_t i = 0; i < messages_to_send; ++i)
-        {
-            send_futures.push_back(std::async(std::launch::async, send_function, i));
         }
 
         // Wait for all send operations to complete
-        for (auto& future : send_futures)
+        for (auto& request : send_requests)
         {
-            future.get();
+            while (!request->isCompleted()) {}
         }
 
         // Wait for remote decrement messages.
         for (auto& registered_send_descriptor : registered_send_descriptors)
         {
-            while (registered_send_descriptor.lock() != nullptr)
-            {
-                std::this_thread::yield(); // Yield to avoid busy-waiting
-            }
+            while (registered_send_descriptor.lock() != nullptr) {}
         }
 
-        is_running = false;
-        progress_cv.notify_all(); // Wake up the progress thread to exit
-
         receive_thread.join();
-        progress_thread.join();
+        m_resources->worker().stopProgressThread();
     }
 
     memory::memory_kind m_kind;
